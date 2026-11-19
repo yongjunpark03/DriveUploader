@@ -255,7 +255,10 @@
     <div class="card">
       <div class="hdr-row">
         <span class="lbl" style="margin-bottom:0;">Branch Mode</span>
-        <span id="badgeBranchMode" class="badge">Minor Branch</span>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <button id="btnFetchNextVer" type="button" style="padding:3px 8px;font-size:11px;">최신 버전 조회 (+1)</button>
+          <span id="badgeBranchMode" class="badge">Minor Branch</span>
+        </div>
       </div>
       <div class="seg-group">
         <button id="btnModeMinor" type="button" class="seg-btn active">Minor (버전 브랜치)</button>
@@ -264,11 +267,11 @@
       <div class="row-2">
         <div>
           <label class="lbl" for="inpBranch">Target Branch</label>
-          <input id="inpBranch" type="text" value="v50.96" />
+          <input id="inpBranch" type="text" value="" placeholder="자동 조회 중..." />
         </div>
         <div>
           <label class="lbl" for="inpCommitMsg">Commit Message</label>
-          <input id="inpCommitMsg" type="text" value="Release v50.96" />
+          <input id="inpCommitMsg" type="text" value="" placeholder="Release ..." />
         </div>
       </div>
     </div>
@@ -302,6 +305,7 @@
 
       const state = {
         mode: "MINOR",
+        lastAutoBranch: "",
         files: [] // [{ path, bytes: Uint8Array, size }]
       };
 
@@ -336,6 +340,107 @@
           binary += String.fromCharCode.apply(null, slice);
         }
         return btoa(binary);
+      };
+
+      // Parse version branch names like v1.0.8, 1.0.8, v1.1.1, v50.96, etc.
+      const parseVersionBranch = (name) => {
+        const m = name.match(/^(v?)(\d+(?:\.\d+)+)$/i);
+        if (!m) return null;
+        const prefix = m[1] || "";
+        const parts = m[2].split(".").map((n) => parseInt(n, 10));
+        if (parts.some((n) => Number.isNaN(n))) return null;
+        return { raw: name, prefix, parts };
+      };
+
+      const compareSemverParts = (a, b) => {
+        const len = Math.max(a.length, b.length);
+        for (let i = 0; i < len; i++) {
+          const va = a[i] ?? 0;
+          const vb = b[i] ?? 0;
+          if (va !== vb) return va - vb;
+        }
+        return 0;
+      };
+
+      const bumpLastSegment = (parsed) => {
+        const nextParts = [...parsed.parts];
+        nextParts[nextParts.length - 1] += 1;
+        return `${parsed.prefix}${nextParts.join(".")}`;
+      };
+
+      const ghFetch = async (url, token, options = {}) => {
+        const headers = {
+          "Accept": "application/vnd.github+json",
+          "Content-Type": "application/json",
+          ...(options.headers || {})
+        };
+        if (token) {
+          headers["Authorization"] = `Bearer ${token}`;
+        }
+        const res = await fetch(url, {
+          ...options,
+          headers
+        });
+        const text = await res.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (_) {}
+        return { ok: res.ok, status: res.status, data, text };
+      };
+
+      const fetchAndApplyNextVersion = async (silentIfNoToken = false) => {
+        const repo = $("inpRepo").value.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "");
+        const token = $("inpToken").value.trim();
+        if (!repo.includes("/")) return;
+
+        const btn = $("btnFetchNextVer");
+        if (btn) btn.disabled = true;
+
+        try {
+          // Fetch branches via matching-refs (unpaginated single call for all heads)
+          const refsRes = await ghFetch(`https://api.github.com/repos/${repo}/git/matching-refs/heads/`, token);
+          let branchNames = [];
+          if (refsRes.ok && Array.isArray(refsRes.data)) {
+            branchNames = refsRes.data.map((r) => (r.ref || "").replace(/^refs\/heads\//, ""));
+          } else {
+            // Fallback to /branches?per_page=100
+            const brRes = await ghFetch(`https://api.github.com/repos/${repo}/branches?per_page=100`, token);
+            if (brRes.ok && Array.isArray(brRes.data)) {
+              branchNames = brRes.data.map((b) => b.name);
+            } else if (!silentIfNoToken) {
+              throw new Error(`브랜치 목록 조회 실패 (${refsRes.status}): ${refsRes.data?.message || "Token 또는 저장소 확인 필요"}`);
+            } else {
+              return;
+            }
+          }
+
+          const parsedList = branchNames
+            .map(parseVersionBranch)
+            .filter(Boolean)
+            .sort((a, b) => compareSemverParts(a.parts, b.parts));
+
+          if (parsedList.length === 0) {
+            if (!silentIfNoToken) {
+              logLine("버전 형식 브랜치를 찾지 못했습니다. (예: 1.0.8 또는 v1.0.8)", "warn-text");
+            }
+            return;
+          }
+
+          const latest = parsedList[parsedList.length - 1];
+          const nextVer = bumpLastSegment(latest);
+          state.lastAutoBranch = nextVer;
+
+          if (state.mode === "MINOR") {
+            $("inpBranch").value = nextVer;
+          }
+          $("inpCommitMsg").value = `Release ${nextVer}`;
+          logLine(`최신 브랜치 '${latest.raw}' 감지 → 다음 버전 '${nextVer}' 자동 설정`, "ok-text");
+        } catch (err) {
+          if (!silentIfNoToken) {
+            logLine(`버전 자동 조회 오류: ${err.message}`, "err-text");
+          }
+        } finally {
+          if (btn) btn.disabled = false;
+        }
       };
 
       const extractTargetFilesFromZip = async (arrayBuffer) => {
@@ -428,7 +533,11 @@
         if (isMajor) {
           $("inpBranch").value = "main";
         } else if ($("inpBranch").value.trim() === "main" || !$("inpBranch").value.trim()) {
-          $("inpBranch").value = "v50.96";
+          if (state.lastAutoBranch) {
+            $("inpBranch").value = state.lastAutoBranch;
+          } else {
+            fetchAndApplyNextVersion(false);
+          }
         }
       };
 
@@ -440,8 +549,8 @@
         for (const file of arr) {
           const lower = file.name.toLowerCase();
           if (lower.endsWith(".zip")) {
-            const verMatch = file.name.match(/(v\d+\.\d+)/i);
-            if (verMatch && state.mode === "MINOR") {
+            const verMatch = file.name.match(/(v?\d+(?:\.\d+)+)/i);
+            if (verMatch && state.mode === "MINOR" && !$("inpBranch").value.trim()) {
               $("inpBranch").value = verMatch[1];
               $("inpCommitMsg").value = `Release ${verMatch[1]}`;
             }
@@ -472,22 +581,6 @@
           }
         }
         renderFileList();
-      };
-
-      const ghFetch = async (url, token, options = {}) => {
-        const res = await fetch(url, {
-          ...options,
-          headers: {
-            "Accept": "application/vnd.github+json",
-            "Authorization": `Bearer ${token}`,
-            "Content-Type": "application/json",
-            ...(options.headers || {})
-          }
-        });
-        const text = await res.text();
-        let data = null;
-        try { data = text ? JSON.parse(text) : null; } catch (_) {}
-        return { ok: res.ok, status: res.status, data, text };
       };
 
       const pushToGitHub = async () => {
@@ -539,7 +632,6 @@
           }
 
           if (!headSha) {
-            // Empty repo fallback: Contents API sequential PUT
             logLine("빈 저장소 감지 -> Contents API 순차 커밋 실행...", "warn-text");
             for (const f of state.files) {
               const getCur = await ghFetch(`${apiBase}/contents/${encodeURIComponent(f.path)}?ref=${encodeURIComponent(branch)}`, token);
@@ -557,7 +649,6 @@
               logLine(`커밋 완료: ${f.path}`, "ok-text");
             }
           } else {
-            // Atomic single-commit via Git Data API
             const commitRes = await ghFetch(`${apiBase}/git/commits/${headSha}`, token);
             if (!commitRes.ok) throw new Error(`Base commit 조회 실패: ${commitRes.data?.message || commitRes.status}`);
             const baseTreeSha = commitRes.data.tree.sha;
@@ -604,6 +695,17 @@
           $("resultBannerText").textContent = `${branch} 푸시 완료 (${state.files.length}개 파일)`;
           $("resultBranchLink").href = `https://github.com/${repo}/tree/${encodeURIComponent(branch)}`;
           $("resultBanner").classList.add("visible");
+
+          // Prepare next version for consecutive uploads
+          if (state.mode === "MINOR") {
+            const parsed = parseVersionBranch(branch);
+            if (parsed) {
+              const nextAfterPush = bumpLastSegment(parsed);
+              state.lastAutoBranch = nextAfterPush;
+              $("inpBranch").value = nextAfterPush;
+              $("inpCommitMsg").value = `Release ${nextAfterPush}`;
+            }
+          }
         } catch (err) {
           logLine(`오류: ${err.message}`, "err-text");
         } finally {
@@ -628,10 +730,14 @@
         try {
           localStorage.setItem("gh_mobile_pat_v1", $("inpToken").value.trim());
           logLine("Token이 브라우저에 저장되었습니다.", "ok-text");
+          fetchAndApplyNextVersion(false);
         } catch (err) {
           logLine("Token 저장 실패 (브라우저 저장소 제한)", "warn-text");
         }
       });
+
+      $("btnFetchNextVer").addEventListener("click", () => fetchAndApplyNextVersion(false));
+      $("inpRepo").addEventListener("change", () => fetchAndApplyNextVersion(true));
 
       $("btnModeMinor").addEventListener("click", () => applyBranchMode("MINOR"));
       $("btnModeMajor").addEventListener("click", () => applyBranchMode("MAJOR"));
@@ -658,6 +764,9 @@
       });
 
       $("btnPushGithub").addEventListener("click", pushToGitHub);
+
+      // Auto-fetch latest branch version on load
+      fetchAndApplyNextVersion(true);
     })();
   </script>
 </body>
